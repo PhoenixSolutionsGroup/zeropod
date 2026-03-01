@@ -106,13 +106,19 @@ func (c *Container) restore(ctx context.Context) (*runc.Container, process.Proce
 	if err != nil {
 		return nil, nil, err
 	}
-	log.G(ctx).Info("restore: process created")
+
+	if createReq.Checkpoint != "" {
+		if err := cleanIPCShm(ctx, c.cfg.spec); err != nil {
+			log.G(ctx).Warnf("failed to clean IPC shm segments: %s", err)
+		}
+	}
 
 	if err := p.Start(ctx); err != nil {
 		lines := printCriuLogs(ctx, filepath.Join(container.Bundle, "work", "restore.log"))
 		c.sendFailEvent(v1.ContainerPhase_RESTORE_FAILED, lines)
 		return nil, nil, fmt.Errorf("start failed during restore: %w", err)
 	}
+
 	c.Container = container
 	c.process = p
 	c.setPhaseNotify(v1.ContainerPhase_RUNNING, time.Since(beforeRestore))

@@ -129,6 +129,10 @@ func (c *Container) checkpoint(ctx context.Context) error {
 		return err
 	}
 
+	if err := cleanIPCShm(ctx, c.cfg.spec); err != nil {
+		log.G(ctx).Warnf("failed to clean IPC shm after checkpoint: %s", err)
+	}
+
 	c.setPhaseNotify(v1.ContainerPhase_SCALED_DOWN, time.Since(beforeCheckpoint))
 	log.G(ctx).Infof("checkpointing done in %s", c.metrics.LastCheckpointDuration.AsDuration())
 
