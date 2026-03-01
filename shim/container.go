@@ -244,12 +244,17 @@ func (c *Container) SkipStart() bool {
 }
 
 func (c *Container) Status() *v1.ContainerStatus {
+	eventTime := timestamppb.Now()
 	phase := v1.ContainerPhase_RUNNING
-	eventTime := c.metrics.LastRestore
+	if c.metrics.LastRestore != nil {
+		eventTime = c.metrics.LastRestore
+	}
 	eventDuration := c.metrics.LastRestoreDuration
 	if c.ScaledDown() {
 		phase = v1.ContainerPhase_SCALED_DOWN
-		eventTime = c.metrics.LastCheckpoint
+		if c.metrics.LastCheckpoint != nil {
+			eventTime = c.metrics.LastCheckpoint
+		}
 		eventDuration = c.metrics.LastCheckpointDuration
 	}
 	return &v1.ContainerStatus{
@@ -319,6 +324,7 @@ func (c *Container) Stop(ctx context.Context) {
 	c.sendEvent(status)
 	c.StopActivator(ctx)
 	c.cleanupImage(ctx)
+	_ = c.netNS.Close()
 }
 
 func (c *Container) cleanupImage(ctx context.Context) {
@@ -358,6 +364,12 @@ func (c *Container) initActivator(ctx context.Context, enableRedirects bool) err
 		act, err := activator.NewServer(ctx, c.netNS)
 		if err != nil {
 			return err
+		}
+		if c.cfg.ProxyTimeout > 0 {
+			act.SetProxyTimeout(c.cfg.ProxyTimeout)
+		}
+		if c.cfg.ConnectTimeout > 0 {
+			act.SetConnectTimeout(c.cfg.ConnectTimeout)
 		}
 		c.activator = act
 	}

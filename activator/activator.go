@@ -40,6 +40,7 @@ type Server struct {
 	sandboxPid     int
 	started        bool
 	peekBufferSize int
+	lastAddr       string
 }
 
 type ConnHook func(net.Conn) (conn net.Conn, cont bool, err error)
@@ -128,6 +129,14 @@ func (s *Server) DisableRedirects() error {
 	return nil
 }
 
+func (s *Server) SetProxyTimeout(d time.Duration) {
+	s.proxyTimeout = d
+}
+
+func (s *Server) SetConnectTimeout(d time.Duration) {
+	s.connectTimeout = d
+}
+
 func (s *Server) SetPeekBufferSize(size int) {
 	s.peekBufferSize = size
 }
@@ -172,11 +181,16 @@ func (s *Server) Stop(ctx context.Context) {
 	}
 
 	for _, l := range s.listeners {
-		l.Close()
+		if err := l.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			log.G(ctx).WithError(err).Error("closing listener")
+		}
+	}
+
+	if err := s.closeMaps(); err != nil {
+		log.G(ctx).WithError(err).Error("closing bpf maps")
 	}
 
 	log.G(ctx).Debugf("removing %s", PinPath(s.sandboxPid))
-
 	_ = os.RemoveAll(PinPath(s.sandboxPid))
 
 	s.wg.Wait()
@@ -227,12 +241,19 @@ func (s *Server) handleConnection(ctx context.Context, netConn net.Conn, port ui
 		log.G(ctx).Errorf("unable to get TCP Addr from remote addr: %T", conn.RemoteAddr())
 		return
 	}
+	// store addr for loop detection
+	s.lastAddr = tcpAddr.String()
 
 	log.G(ctx).Debugf("registering connection on remote port %d from %s", tcpAddr.Port, tcpAddr.IP.String())
 	if err := s.registerConnection(uint16(tcpAddr.Port)); err != nil {
 		log.G(ctx).Errorf("error registering connection: %s", err)
 		return
 	}
+	defer func() {
+		if err := s.removeConnection(uint16(tcpAddr.Port)); err != nil {
+			log.G(ctx).Warnf("error removing connection: %s", err)
+		}
+	}()
 
 	if err := s.restoreHook(); err != nil {
 		log.G(ctx).Errorf("restoreHook: %s", err)
@@ -247,16 +268,19 @@ func (s *Server) handleConnection(ctx context.Context, netConn net.Conn, port ui
 	defer backendConn.Close()
 
 	log.G(ctx).Println("dial succeeded", backendConn.RemoteAddr().String())
+	if s.lastAddr == backendConn.LocalAddr().String() {
+		log.G(ctx).Warnf("loop detected on %s, disabling redirects", backendConn.LocalAddr().String())
+		if err := s.DisableRedirects(); err != nil {
+			log.G(ctx).WithError(err).Errorf("disabling redirects in loop, closing connection prematurely")
+			return
+		}
+	}
 
 	requestContext, cancel := context.WithTimeout(ctx, s.proxyTimeout)
 	s.proxyCancel = cancel
 	defer cancel()
 	if err := proxy(requestContext, conn, backendConn); err != nil {
 		log.G(ctx).Errorf("error proxying request: %s", err)
-	}
-
-	if err := s.removeConnection(uint16(tcpAddr.Port)); err != nil {
-		log.G(ctx).Warnf("error removing connection: %s", err)
 	}
 
 	log.G(ctx).Println("connection closed", conn.RemoteAddr().String())
@@ -372,6 +396,26 @@ func (s *Server) loadPinnedMaps() error {
 	}
 
 	return nil
+}
+
+func (s *Server) closeMaps() error {
+	errs := []error{}
+	if s.maps.ActiveConnections != nil {
+		errs = append(errs, s.maps.ActiveConnections.Close())
+	}
+	if s.maps.DisableRedirect != nil {
+		errs = append(errs, s.maps.DisableRedirect.Close())
+	}
+	if s.maps.EgressRedirects != nil {
+		errs = append(errs, s.maps.EgressRedirects.Close())
+	}
+	if s.maps.IngressRedirects != nil {
+		errs = append(errs, s.maps.IngressRedirects.Close())
+	}
+	if s.maps.SocketTracker != nil {
+		errs = append(errs, s.maps.SocketTracker.Close())
+	}
+	return errors.Join(errs...)
 }
 
 func (s *Server) mapPath(name string) string {

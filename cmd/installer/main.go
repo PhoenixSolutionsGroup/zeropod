@@ -12,6 +12,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	goruntime "runtime"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"time"
@@ -19,12 +21,9 @@ import (
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/cmd/containerd/server/config"
 	"github.com/coreos/go-systemd/v22/dbus"
-	v1 "github.com/ctrox/zeropod/api/runtime/v1"
 	"github.com/ctrox/zeropod/manager/node"
-	"github.com/ctrox/zeropod/shim"
 	"github.com/pelletier/go-toml/v2"
 	corev1 "k8s.io/api/core/v1"
-	knodev1 "k8s.io/api/node/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -37,6 +36,11 @@ var (
 	hostOptPath    = flag.String("host-opt-path", defaultOptPath, "path where zeropod binaries are stored on the host")
 	uninstall      = flag.Bool("uninstall", false, "uninstalls zeropod by cleaning up all the files the installer created")
 	installTimeout = flag.Duration("timeout", time.Minute, "duration the installer waits for the installation to complete")
+	versionFlag    = flag.Bool("version", false, "output version and exit")
+
+	version   = ""
+	revision  = ""
+	goVersion = goruntime.Version()
 )
 
 type containerRuntime string
@@ -119,8 +123,32 @@ network-lock skip
 `
 )
 
+func init() {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return
+	}
+
+	if version == "" {
+		version = info.Main.Version
+	}
+
+	for _, kv := range info.Settings {
+		switch kv.Key {
+		case "vcs.revision":
+			revision = kv.Value
+		}
+	}
+}
+
 func main() {
 	flag.Parse()
+
+	if *versionFlag {
+		printVersion()
+		os.Exit(0)
+	}
+	log.Printf("starting installer version=%s revision=%s go=%s", version, revision, goVersion)
 
 	client, err := inClusterClient()
 	if err != nil {
@@ -151,12 +179,6 @@ func main() {
 
 	log.Println("installed runtime")
 
-	if err := installRuntimeClass(ctx, client); err != nil {
-		log.Fatalf("error installing zeropod runtimeClass: %s", err)
-	}
-
-	log.Println("installed runtimeClass")
-
 	if err := loadTLSCA(ctx, client); err != nil {
 		log.Fatalf("error loading TLS CA certificate: %s", err)
 	}
@@ -164,6 +186,14 @@ func main() {
 	log.Println("installed ca cert")
 
 	log.Println("installer completed")
+}
+
+func printVersion() {
+	fmt.Printf("%s:\n", filepath.Base(os.Args[0]))
+	fmt.Println("  Version: ", version)
+	fmt.Println("  Revision:", revision)
+	fmt.Println("  Go version:", goVersion)
+	fmt.Println("")
 }
 
 func installCriu(ctx context.Context) error {
@@ -598,31 +628,6 @@ func optPath(ctx context.Context, runtime containerRuntime) string {
 	return defaultOptPath
 }
 
-func installRuntimeClass(ctx context.Context, client kubernetes.Interface) error {
-	runtimeClass := &knodev1.RuntimeClass{
-		ObjectMeta: metav1.ObjectMeta{Name: v1.RuntimeClassName},
-		Handler:    v1.RuntimeClassName,
-		Scheduling: &knodev1.Scheduling{NodeSelector: map[string]string{shim.NodeLabel: "true"}},
-	}
-
-	if _, err := client.NodeV1().RuntimeClasses().Create(ctx, runtimeClass, metav1.CreateOptions{}); err != nil {
-		if !kerrors.IsAlreadyExists(err) {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func removeRuntimeClass(ctx context.Context, client kubernetes.Interface) error {
-	if err := client.NodeV1().RuntimeClasses().Delete(ctx, v1.RuntimeClassName, metav1.DeleteOptions{}); err != nil {
-		if !kerrors.IsNotFound(err) {
-			return err
-		}
-	}
-	return nil
-}
-
 func inClusterClient() (kubernetes.Interface, error) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
@@ -635,10 +640,6 @@ func inClusterClient() (kubernetes.Interface, error) {
 // runUninstall removes all components installed by zeropod and restores the
 // original configuration.
 func runUninstall(ctx context.Context, client kubernetes.Interface, runtime containerRuntime) error {
-	if err := removeRuntimeClass(ctx, client); err != nil {
-		return err
-	}
-
 	if err := os.RemoveAll(optPath(ctx, runtime)); err != nil {
 		return fmt.Errorf("removing opt path: %w", err)
 	}

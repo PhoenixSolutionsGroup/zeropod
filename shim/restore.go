@@ -38,6 +38,11 @@ var (
 // retry without the checkpoint and disable checkpointing for the rest of the
 // container lifetime.
 func (c *Container) Restore(ctx context.Context) (*runc.Container, process.Process, error) {
+	c.CheckpointRestore.Lock()
+	defer c.CheckpointRestore.Unlock()
+	if !c.ScaledDown() {
+		return nil, nil, ErrAlreadyRestored
+	}
 	cont, p, err := c.restore(ctx)
 	if err != nil && !c.cfg.DisableCheckpointing {
 		log.G(ctx).Errorf("restore failed, disabling checkpointing and retrying: %s", err)
@@ -48,12 +53,6 @@ func (c *Container) Restore(ctx context.Context) (*runc.Container, process.Proce
 }
 
 func (c *Container) restore(ctx context.Context) (*runc.Container, process.Process, error) {
-	c.CheckpointRestore.Lock()
-	defer c.CheckpointRestore.Unlock()
-	if !c.ScaledDown() {
-		return nil, nil, ErrAlreadyRestored
-	}
-
 	// cleanup image regardless of success/failure
 	defer c.deleteImage(ctx)
 	beforeRestore := time.Now()
@@ -107,13 +106,19 @@ func (c *Container) restore(ctx context.Context) (*runc.Container, process.Proce
 	if err != nil {
 		return nil, nil, err
 	}
-	log.G(ctx).Info("restore: process created")
+
+	if createReq.Checkpoint != "" {
+		if err := cleanIPCShm(ctx, c.cfg.spec); err != nil {
+			log.G(ctx).Warnf("failed to clean IPC shm segments: %s", err)
+		}
+	}
 
 	if err := p.Start(ctx); err != nil {
 		lines := printCriuLogs(ctx, filepath.Join(container.Bundle, "work", "restore.log"))
 		c.sendFailEvent(v1.ContainerPhase_RESTORE_FAILED, lines)
 		return nil, nil, fmt.Errorf("start failed during restore: %w", err)
 	}
+
 	c.Container = container
 	c.process = p
 	c.setPhaseNotify(v1.ContainerPhase_RUNNING, time.Since(beforeRestore))
