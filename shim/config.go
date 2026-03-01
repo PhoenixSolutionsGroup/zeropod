@@ -28,6 +28,7 @@ const (
 	ProxyTimeoutAnnotationKey        = "zeropod.ctrox.dev/proxy-timeout"
 	ConnectTimeoutAnnotationKey      = "zeropod.ctrox.dev/connect-timeout"
 	DisableMigrateDataAnnotationKey  = "zeropod.ctrox.dev/disable-migrate-data"
+	WakePeersAnnotationKey           = "zeropod.ctrox.dev/wake-peers"
 	CRIContainerNameAnnotation       = "io.kubernetes.cri.container-name"
 	CRIContainerTypeAnnotation       = "io.kubernetes.cri.container-type"
 	CRIPodNameAnnotation             = "io.kubernetes.cri.sandbox-name"
@@ -63,6 +64,7 @@ type Config struct {
 	ProxyTimeout          time.Duration
 	ConnectTimeout        time.Duration
 	DisableMigrateData    bool
+	WakePeers             []string
 	spec                  *specs.Spec
 }
 
@@ -192,6 +194,11 @@ func NewConfig(ctx context.Context, spec *specs.Spec) (*Config, error) {
 		}
 	}
 
+	var wakePeers []string
+	if v := spec.Annotations[WakePeersAnnotationKey]; v != "" {
+		wakePeers = strings.Split(v, containersDelim)
+	}
+
 	return &Config{
 		Ports:                 containerPorts,
 		ScaleDownDuration:     dur,
@@ -211,6 +218,7 @@ func NewConfig(ctx context.Context, spec *specs.Spec) (*Config, error) {
 		ProxyTimeout:          proxyTimeout,
 		ConnectTimeout:        connectTimeout,
 		DisableMigrateData:    disableMigrateData,
+		WakePeers:             wakePeers,
 		spec:                  spec,
 	}, nil
 }

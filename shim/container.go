@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"slices"
 	"sync"
@@ -455,6 +456,23 @@ func (c *Container) startActivator(ctx context.Context, ports ...uint16) error {
 func (c *Container) restoreHandler(ctx context.Context) activator.RestoreHook {
 	return func() error {
 		log.G(ctx).Printf("got a request")
+
+		// Wake peer services concurrently before restoring ourselves.
+		// A TCP dial to a peer's zeropod proxy triggers its restore in parallel.
+		for _, peer := range c.cfg.WakePeers {
+			go func(addr string) {
+				if err := c.netNS.Do(func(_ ns.NetNS) error {
+					conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+					if err != nil {
+						return err
+					}
+					conn.Close()
+					return nil
+				}); err != nil {
+					log.G(ctx).Debugf("wake-peer %s: %s", addr, err)
+				}
+			}(peer)
+		}
 
 		restoredContainer, _, err := c.Restore(ctx)
 		if err != nil {
