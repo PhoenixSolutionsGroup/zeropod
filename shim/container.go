@@ -627,6 +627,9 @@ func (c *Container) restoreHandler(ctx context.Context) activator.RestoreHook {
 					if err != nil {
 						return err
 					}
+					// Send a byte so the peer's activator doesn't classify this
+					// as a kube-probe (bare connect+close) and skip the restore.
+					_, _ = conn.Write([]byte{0})
 					conn.Close()
 					return nil
 				}); err != nil {
