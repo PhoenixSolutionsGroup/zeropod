@@ -25,6 +25,9 @@ const (
 	MetricRunning               = "running"
 	MetricCheckpointErrorsTotal = "checkpoint_errors_total"
 	MetricRestoreErrorsTotal    = "restore_errors_total"
+	MetricCheckpointMemoryBytes = "checkpoint_memory_bytes"
+	MetricDryRunScaleDownsTotal = "dry_run_scale_downs_total"
+	MetricDryRunRestoresTotal   = "dry_run_restores_total"
 )
 
 var (
@@ -37,14 +40,17 @@ var (
 )
 
 type Collector struct {
-	log                *slog.Logger
-	checkpointDuration *prometheus.HistogramVec
-	restoreDuration    *prometheus.HistogramVec
-	lastCheckpointTime *prometheus.GaugeVec
-	lastRestoreTime    *prometheus.GaugeVec
-	running            *prometheus.GaugeVec
-	checkpointErrors   *prometheus.CounterVec
-	restoreErrors      *prometheus.CounterVec
+	log                   *slog.Logger
+	checkpointDuration    *prometheus.HistogramVec
+	restoreDuration       *prometheus.HistogramVec
+	lastCheckpointTime    *prometheus.GaugeVec
+	lastRestoreTime       *prometheus.GaugeVec
+	running               *prometheus.GaugeVec
+	checkpointErrors      *prometheus.CounterVec
+	restoreErrors         *prometheus.CounterVec
+	checkpointMemoryBytes *prometheus.GaugeVec
+	dryRunScaleDowns      *prometheus.CounterVec
+	dryRunRestores        *prometheus.CounterVec
 }
 
 func NewCollector(log *slog.Logger) *Collector {
@@ -93,6 +99,24 @@ func NewCollector(log *slog.Logger) *Collector {
 			Name:      MetricRestoreErrorsTotal,
 			Help:      "Total number of restore errors.",
 		}, commonLabels),
+
+		checkpointMemoryBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: MetricsNamespace,
+			Name:      MetricCheckpointMemoryBytes,
+			Help:      "Memory pages dumped by criu in bytes.",
+		}, commonLabels),
+
+		dryRunScaleDowns: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: MetricsNamespace,
+			Name:      MetricDryRunScaleDownsTotal,
+			Help:      "Total number of simulated dry-run scale downs.",
+		}, commonLabels),
+
+		dryRunRestores: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: MetricsNamespace,
+			Name:      MetricDryRunRestoresTotal,
+			Help:      "Total number of simulated dry-run restores.",
+		}, commonLabels),
 	}
 }
 
@@ -136,6 +160,11 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 			}
 			c.checkpointErrors.With(l).Add(float64(metrics.CheckpointErrors))
 			c.restoreErrors.With(l).Add(float64(metrics.RestoreErrors))
+			c.checkpointMemoryBytes.With(l).Set(float64(metrics.CheckpointMemoryBytes))
+			if metrics.DryRun {
+				c.dryRunScaleDowns.With(l).Add(float64(metrics.DryRunScaleDowns))
+				c.dryRunRestores.With(l).Add(float64(metrics.DryRunRestores))
+			}
 		}
 	}
 	c.running.Collect(ch)
@@ -145,6 +174,9 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	c.lastRestoreTime.Collect(ch)
 	c.checkpointErrors.Collect(ch)
 	c.restoreErrors.Collect(ch)
+	c.checkpointMemoryBytes.Collect(ch)
+	c.dryRunScaleDowns.Collect(ch)
+	c.dryRunRestores.Collect(ch)
 }
 
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
@@ -155,6 +187,8 @@ func collectMetricsOverTTRPC(ctx context.Context, sock string) ([]*v1.ContainerM
 	if err != nil {
 		return nil, err
 	}
+	//nolint:errcheck
+	defer conn.Close()
 
 	resp, err := v1.NewShimClient(ttrpc.NewClient(conn)).Metrics(ctx, &v1.MetricsRequest{})
 	if err != nil {
@@ -185,4 +219,7 @@ func (c *Collector) deleteMetrics(status *v1.ContainerStatus) {
 	c.lastRestoreTime.Delete(l)
 	c.checkpointErrors.Delete(l)
 	c.restoreErrors.Delete(l)
+	c.checkpointMemoryBytes.Delete(l)
+	c.dryRunScaleDowns.Delete(l)
+	c.dryRunRestores.Delete(l)
 }

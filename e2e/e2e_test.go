@@ -2,7 +2,6 @@ package e2e
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"runtime"
 	"strings"
@@ -12,7 +11,6 @@ import (
 
 	v1 "github.com/ctrox/zeropod/api/shim/v1"
 	"github.com/ctrox/zeropod/manager"
-	"github.com/ctrox/zeropod/shim"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
@@ -20,7 +18,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/utils/ptr"
 )
 
 func TestE2E(t *testing.T) {
@@ -101,6 +98,13 @@ func TestE2E(t *testing.T) {
 		},
 		"pod with scaledown disabled": {
 			pod:            testPod(scaleDownAfter(0)),
+			parallelReqs:   1,
+			sequentialReqs: 1,
+			maxReqDuration: time.Second,
+			expectRunning:  true,
+		},
+		"pod with dry-run": {
+			pod:            testPod(dryRun(true), defaultScaleDownAfter),
 			parallelReqs:   1,
 			sequentialReqs: 1,
 			maxReqDuration: time.Second,
@@ -192,7 +196,7 @@ func TestE2E(t *testing.T) {
 		"pod with large HTTP probe and increased buffer": {
 			pod: testPod(
 				scaleDownAfter(time.Second),
-				annotations(map[string]string{shim.ProbeBufferSizeAnnotationKey: "2048"}),
+				annotations(map[string]string{v1.ProbeBufferSizeAnnotationKey: "2048"}),
 				addContainer("nginx", "nginx", nil, 80),
 				livenessProbe(&corev1.Probe{
 					InitialDelaySeconds: 3,
@@ -228,6 +232,7 @@ func TestE2E(t *testing.T) {
 			cleanupService := createServiceAndWait(t, ctx, e2e.client, tc.svc, 1)
 			defer cleanupPod()
 			defer cleanupService()
+			probeHTTP(t, e2e.url())
 
 			if tc.waitScaledDown {
 				waitUntilScaledDown(t, ctx, e2e.client, tc.pod)
@@ -251,7 +256,7 @@ func TestE2E(t *testing.T) {
 						c.Transport = &http.Transport{DisableKeepAlives: !tc.keepAlive}
 
 						before := time.Now()
-						resp, err := c.Get(fmt.Sprintf("http://127.0.0.1:%d", e2e.port))
+						resp, err := c.Get(e2e.url())
 						if err != nil {
 							t.Error(err)
 							return
@@ -372,11 +377,12 @@ func TestE2E(t *testing.T) {
 		cleanupService := createServiceAndWait(t, ctx, e2e.client, testService(8080), 1)
 		defer cleanupPod()
 		defer cleanupService()
+		probeHTTP(t, e2e.url())
 		// we expect it to scale down even though a constant livenessProbe is
 		// hitting it
 		waitUntilScaledDown(t, ctx, e2e.client, pod)
 		// make a real request and expect it to scale down again
-		resp, err := c.Get(fmt.Sprintf("http://127.0.0.1:%d", e2e.port))
+		resp, err := c.Get(e2e.url())
 		require.NoError(t, err)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
 		waitUntilScaledDown(t, ctx, e2e.client, pod)
@@ -451,12 +457,12 @@ func TestE2E(t *testing.T) {
 		}{
 			"running": {
 				metric:     prometheus.BuildFQName(manager.MetricsNamespace, "", manager.MetricRunning),
-				gaugeValue: ptr.To(float64(1)),
+				gaugeValue: new(float64(1)),
 				pod:        runningPod,
 			},
 			"not running": {
 				metric:     prometheus.BuildFQName(manager.MetricsNamespace, "", manager.MetricRunning),
-				gaugeValue: ptr.To(float64(0)),
+				gaugeValue: new(float64(0)),
 				pod:        checkpointedPod,
 			},
 			"last checkpoint time": {
@@ -466,7 +472,7 @@ func TestE2E(t *testing.T) {
 			"checkpoint duration": {
 				metric:                  prometheus.BuildFQName(manager.MetricsNamespace, "", manager.MetricCheckpointDuration),
 				pod:                     checkpointedPod,
-				minHistogramSampleCount: ptr.To(uint64(1)),
+				minHistogramSampleCount: new(uint64(1)),
 			},
 			"last restore time": {
 				metric: prometheus.BuildFQName(manager.MetricsNamespace, "", manager.MetricLastRestoreTime),
@@ -475,17 +481,21 @@ func TestE2E(t *testing.T) {
 			"restore duration": {
 				metric:                  prometheus.BuildFQName(manager.MetricsNamespace, "", manager.MetricRestoreDuration),
 				pod:                     restoredPod,
-				minHistogramSampleCount: ptr.To(uint64(1)),
+				minHistogramSampleCount: new(uint64(1)),
 			},
 			"checkpoint errors": {
 				metric:       prometheus.BuildFQName(manager.MetricsNamespace, "", manager.MetricCheckpointErrorsTotal),
-				pod:          restoredPod,
-				counterValue: ptr.To(float64(0)),
+				pod:          checkpointedPod,
+				counterValue: new(float64(0)),
 			},
 			"restore errors": {
 				metric:       prometheus.BuildFQName(manager.MetricsNamespace, "", manager.MetricRestoreErrorsTotal),
 				pod:          restoredPod,
-				counterValue: ptr.To(float64(0)),
+				counterValue: new(float64(0)),
+			},
+			"checkpoint memory": {
+				metric: prometheus.BuildFQName(manager.MetricsNamespace, "", manager.MetricCheckpointMemoryBytes),
+				pod:    checkpointedPod,
 			},
 		}
 

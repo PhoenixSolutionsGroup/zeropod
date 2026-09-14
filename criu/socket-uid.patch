@@ -1,0 +1,65 @@
+diff --git a/criu/include/sk-inet.h b/criu/include/sk-inet.h
+index 69ee8589e..0a60fc5bb 100644
+--- a/criu/include/sk-inet.h
++++ b/criu/include/sk-inet.h
+@@ -41,6 +41,7 @@ struct inet_sk_desc {
+ 	unsigned int dst_addr[4];
+ 	unsigned short shutdown;
+ 	bool cork;
++	uid_t uid;
+ 
+ 	int rfd;
+ 	int cpt_reuseaddr;
+diff --git a/criu/sk-inet.c b/criu/sk-inet.c
+index 566d1c230..a9e9f1aea 100644
+--- a/criu/sk-inet.c
++++ b/criu/sk-inet.c
+@@ -272,6 +272,7 @@ static struct inet_sk_desc *gen_uncon_sk(int lfd, const struct fd_parms *p, int
+ 
+ 	sk->sd.family = family;
+ 	sk->type = type;
++	sk->uid = p->stat.st_uid;
+ 
+ 	if (sk->sd.family == AF_INET)
+ 		aux = sizeof(struct sockaddr_in);
+@@ -527,6 +528,8 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
+ 	ie.dst_port = sk->dst_port;
+ 	ie.backlog = sk->wqlen;
+ 	ie.flags = p->flags;
++	ie.uid = userns_uid(sk->uid);
++	ie.has_uid = true;
+ 
+ 	ie.fown = (FownEntry *)&p->fown;
+ 	ie.opts = &skopts;
+@@ -679,6 +682,7 @@ int inet_collect_one(struct nlmsghdr *h, int family, int type, struct ns_id *ns)
+ 	d->wqlen = m->idiag_wqueue;
+ 	memcpy(d->src_addr, m->id.idiag_src, sizeof(u32) * 4);
+ 	memcpy(d->dst_addr, m->id.idiag_dst, sizeof(u32) * 4);
++	d->uid = m->idiag_uid;
+ 
+ 	if (tb[INET_DIAG_SHUTDOWN])
+ 		d->shutdown = nla_get_u8(tb[INET_DIAG_SHUTDOWN]);
+@@ -897,6 +901,13 @@ static int open_inet_sk(struct file_desc *d, int *new_fd)
+ 		return -1;
+ 	}
+ 
++	if (ie->has_uid) {
++		if (fchown(sk, ie->uid, -1) < 0) {
++			pr_perror("Failed to set socket UID to %u", ie->uid);
++			goto err;
++		}
++	}
++
+ 	if (reset_setsockcreatecon())
+ 		goto err;
+ 
+diff --git a/images/sk-inet.proto b/images/sk-inet.proto
+index 2c709e018..a6bb497e7 100644
+--- a/images/sk-inet.proto
++++ b/images/sk-inet.proto
+@@ -58,4 +58,5 @@ message inet_sk_entry {
+ 	optional uint32			ns_id		= 18;
+ 	optional sk_shutdown		shutdown	= 19;
+ 	optional tcp_opts_entry		tcp_opts	= 20;
++	optional uint32			uid		= 21;
+ }

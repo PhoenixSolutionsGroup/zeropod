@@ -23,13 +23,13 @@ import (
 	v1 "github.com/ctrox/zeropod/api/runtime/v1"
 	shimv1 "github.com/ctrox/zeropod/api/shim/v1"
 	"github.com/ctrox/zeropod/manager"
-	"github.com/ctrox/zeropod/shim"
 	"github.com/go-logr/logr"
 	"github.com/phayes/freeport"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
@@ -49,7 +49,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/util/retry"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
@@ -85,11 +84,15 @@ type e2eConfig struct {
 }
 
 func (e2e *e2eConfig) cleanup() error {
-	defer os.RemoveAll(e2e.kubeconfigName)
 	if err := stopKind(e2e.clusterName, e2e.kubeconfigName); err != nil {
+		_ = os.RemoveAll(e2e.kubeconfigName)
 		return err
 	}
 	return os.RemoveAll(e2e.kubeconfigName)
+}
+
+func (e2e *e2eConfig) url() string {
+	return fmt.Sprintf("http://127.0.0.1:%d", e2e.port)
 }
 
 var images = []image{
@@ -192,12 +195,12 @@ func startKind(t testing.TB, name, kubeconfig string, port int) (c *rest.Config,
 				},
 				{
 					Role:        v1alpha4.WorkerRole,
-					Labels:      map[string]string{shim.NodeLabel: "true"},
+					Labels:      map[string]string{shimv1.NodeLabel: "true"},
 					ExtraMounts: extraMounts,
 				},
 				{
 					Role:        v1alpha4.WorkerRole,
-					Labels:      map[string]string{shim.NodeLabel: "true"},
+					Labels:      map[string]string{shimv1.NodeLabel: "true"},
 					ExtraMounts: extraMounts,
 				},
 			},
@@ -247,6 +250,7 @@ func loadImages(node nodes.Node, imageFile string) error {
 	if err != nil {
 		return errors.Wrap(err, "failed to open image")
 	}
+	//nolint:errcheck
 	defer f.Close()
 	return nodeutils.LoadImageArchive(node, f)
 }
@@ -257,7 +261,7 @@ func getImages(t testing.TB) (string, error) {
 		return "", fmt.Errorf("failed to create tempdir: %w", err)
 	}
 	t.Cleanup(func() {
-		os.RemoveAll(dir)
+		assert.NoError(t, os.RemoveAll(dir))
 	})
 
 	imagesTarPath := filepath.Join(dir, "images.tar")
@@ -374,43 +378,49 @@ func annotations(annotations map[string]string) podOption {
 
 func preDump(preDump bool) podOption {
 	return annotations(map[string]string{
-		shim.PreDumpAnnotationKey: strconv.FormatBool(preDump),
+		shimv1.PreDumpAnnotationKey: strconv.FormatBool(preDump),
 	})
 }
 
 func disableCheckpointing(disable bool) podOption {
 	return annotations(map[string]string{
-		shim.DisableCheckpoiningAnnotationKey: strconv.FormatBool(disable),
+		shimv1.DisableCheckpoiningAnnotationKey: strconv.FormatBool(disable),
+	})
+}
+
+func dryRun(dryRun bool) podOption {
+	return annotations(map[string]string{
+		shimv1.DryRunAnnotationKey: strconv.FormatBool(dryRun),
 	})
 }
 
 func scaleDownAfter(dur time.Duration) podOption {
 	return annotations(map[string]string{
-		shim.ScaleDownDurationAnnotationKey: dur.String(),
+		shimv1.ScaleDownDurationAnnotationKey: dur.String(),
 	})
 }
 
 func containerNamesAnnotation(names ...string) podOption {
 	return annotations(map[string]string{
-		shim.ContainerNamesAnnotationKey: strings.Join(names, ","),
+		shimv1.ContainerNamesAnnotationKey: strings.Join(names, ","),
 	})
 }
 
 func portsAnnotation(portsMap string) podOption {
 	return annotations(map[string]string{
-		shim.PortsAnnotationKey: portsMap,
+		shimv1.PortsAnnotationKey: portsMap,
 	})
 }
 
 func migrateAnnotation(container string) podOption {
 	return annotations(map[string]string{
-		shim.MigrateAnnotationKey: container,
+		shimv1.MigrateAnnotationKey: container,
 	})
 }
 
 func liveMigrateAnnotation(container string) podOption {
 	return annotations(map[string]string{
-		shim.LiveMigrateAnnotationKey: container,
+		shimv1.LiveMigrateAnnotationKey: container,
 	})
 }
 
@@ -438,7 +448,7 @@ func readinessProbe(probe *corev1.Probe, index int) podOption {
 
 func disableDataMigration() podOption {
 	return annotations(map[string]string{
-		shim.DisableMigrateDataAnnotationKey: "true",
+		shimv1.DisableMigrateDataAnnotationKey: "true",
 	})
 }
 
@@ -475,7 +485,7 @@ func testPod(opts ...podOption) *corev1.Pod {
 			Labels:       map[string]string{"app": "zeropod-e2e"},
 		},
 		Spec: corev1.PodSpec{
-			RuntimeClassName: ptr.To(v1.RuntimeClassName),
+			RuntimeClassName: new(v1.RuntimeClassName),
 		},
 	}
 
@@ -526,7 +536,7 @@ func createPodAndWait(t testing.TB, ctx context.Context, client client.Client, p
 	}, time.Minute, time.Second, "waiting for pod to be running")
 
 	return func() {
-		client.Delete(ctx, pod)
+		assert.NoError(t, client.Delete(ctx, pod))
 		assert.NoError(t, err)
 		require.Eventually(t, func() bool {
 			if err := client.Get(ctx, objectName(pod), pod); err != nil {
@@ -538,7 +548,7 @@ func createPodAndWait(t testing.TB, ctx context.Context, client client.Client, p
 	}
 }
 
-func freezerDeployment(name, namespace string, memoryGiB int, opts ...podOption) *appsv1.Deployment {
+func freezerDeployment(name, namespace string, memoryMiB int, opts ...podOption) *appsv1.Deployment {
 	deploy := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -551,7 +561,7 @@ func freezerDeployment(name, namespace string, memoryGiB int, opts ...podOption)
 					"name": name,
 				},
 			},
-			Replicas: ptr.To(int32(1)),
+			Replicas: new(int32(1)),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
@@ -560,13 +570,13 @@ func freezerDeployment(name, namespace string, memoryGiB int, opts ...podOption)
 					},
 				},
 				Spec: corev1.PodSpec{
-					RuntimeClassName: ptr.To(v1.RuntimeClassName),
+					RuntimeClassName: new(v1.RuntimeClassName),
 					Containers: []corev1.Container{{
 						Name:            "freezer",
 						Image:           "ghcr.io/ctrox/zeropod-freezer",
 						ImagePullPolicy: corev1.PullIfNotPresent,
 						Command:         []string{"/freezer"},
-						Args:            []string{"-memory", strconv.Itoa(memoryGiB)},
+						Args:            []string{"-memory", strconv.Itoa(memoryMiB)},
 						Ports: []corev1.ContainerPort{{
 							Name:          "freezer",
 							ContainerPort: 8080,
@@ -604,13 +614,16 @@ func createDeployAndWait(t testing.TB, ctx context.Context, c client.Client, dep
 	}, time.Minute, time.Second, "waiting for pods of deployment to be running")
 
 	return func() {
-		c.Delete(ctx, deploy)
-		assert.NoError(t, err)
+		assert.NoError(t, c.Delete(ctx, deploy))
 		require.Eventually(t, func() bool {
 			if err := c.Get(ctx, objectName(deploy), deploy); err != nil {
 				return true
 			}
-			return false
+			podList := &corev1.PodList{}
+			if err := c.List(ctx, podList, client.MatchingLabels(deploy.Spec.Selector.MatchLabels)); err != nil {
+				return false
+			}
+			return len(podList.Items) == 0
 		}, time.Minute*2, time.Second, "waiting for deployment to be deleted")
 	}
 }
@@ -670,9 +683,6 @@ func waitForService(t testing.TB, ctx context.Context, c client.Client, svc *cor
 			printContainerdLogs(t, "zeropod-e2e-worker", "zeropod-e2e-worker2")
 		}
 	}
-	// we give it some more time before returning just to make sure it's
-	// really ready to receive requests.
-	time.Sleep(time.Millisecond * 500)
 }
 
 func endpointsReady(endpoints []discoveryv1.Endpoint) bool {
@@ -683,6 +693,20 @@ func endpointsReady(endpoints []discoveryv1.Endpoint) bool {
 		}
 	}
 	return ready == len(endpoints)
+}
+
+func probeHTTP(t testing.TB, addr string) {
+	c := &http.Client{
+		Timeout: time.Second * 1,
+	}
+	assert.Eventually(t, func() bool {
+		resp, err := c.Get(addr)
+		if err != nil {
+			return false
+		}
+		assert.NoError(t, resp.Body.Close())
+		return true
+	}, time.Second*10, time.Millisecond*100)
 }
 
 func cordonNode(t testing.TB, ctx context.Context, client client.Client, name string) (uncordon func()) {
@@ -801,12 +825,16 @@ func restoreCount(t testing.TB, ctx context.Context, client client.Client, cfg *
 }
 
 func waitUntilScaledDown(t testing.TB, ctx context.Context, c client.Client, pod *corev1.Pod) {
-	for _, container := range pod.Spec.Containers {
-		require.Eventually(t, func() bool {
-			ok, err := isScaledDown(ctx, c, pod, container.Name)
-			t.Logf("scaled down: %v: %s", ok, pod.GetLabels()[path.Join(manager.StatusLabelKeyPrefix, container.Name)])
-			return err == nil && ok
-		}, time.Second*15, time.Second)
+	// we loop to ensure it is stable in scaled down state
+	for range 3 {
+		for _, container := range pod.Spec.Containers {
+			require.Eventually(t, func() bool {
+				ok, err := isScaledDown(ctx, c, pod, container.Name)
+				t.Logf("scaled down: %v: %s", ok, pod.GetLabels()[path.Join(manager.StatusLabelKeyPrefix, container.Name)])
+				return err == nil && ok
+			}, time.Second*15, time.Second)
+		}
+		time.Sleep(time.Second)
 	}
 }
 
@@ -925,7 +953,7 @@ func getNodeMetrics(ctx context.Context, c client.Client, cfg *rest.Config) (map
 			return nil, err
 		}
 
-		var parser expfmt.TextParser
+		parser := expfmt.NewTextParser(model.UTF8Validation)
 		m, err := parser.TextToMetricFamilies(resp.Body)
 		if err != nil {
 			return nil, err
@@ -980,6 +1008,7 @@ func getPodLogs(ctx context.Context, cfg *rest.Config, pod corev1.Pod) (string, 
 	if err != nil {
 		return "", fmt.Errorf("opening log stream: %w", err)
 	}
+	//nolint:errcheck
 	defer podLogs.Close()
 
 	buf := new(bytes.Buffer)
@@ -1014,6 +1043,7 @@ func freezerRead(port int) (*freeze, error) {
 	if err != nil {
 		return nil, err
 	}
+	//nolint:errcheck
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
@@ -1033,7 +1063,7 @@ func availabilityCheck(ctx context.Context, port int) time.Duration {
 			downtime += time.Since(beforeReq)
 			continue
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		select {
 		case <-ctx.Done():
 			return downtime

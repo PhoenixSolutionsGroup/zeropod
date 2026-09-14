@@ -13,11 +13,6 @@ import (
 	"github.com/ctrox/zeropod/activator"
 )
 
-// defaultProbeBufferSize should be able to fit kube-probe HTTP requests with
-// reasonable path and header sizes but should still be small enough to not
-// impact performance.
-const defaultProbeBufferSize = 1024
-
 func (c *Container) detectProbe(ctx context.Context) activator.ConnHook {
 	if c.cfg.DisableProbeDetection {
 		return func(conn net.Conn) (net.Conn, bool, error) {
@@ -25,6 +20,9 @@ func (c *Container) detectProbe(ctx context.Context) activator.ConnHook {
 		}
 	}
 	return func(netConn net.Conn) (net.Conn, bool, error) {
+		if !isKubeletAddr(ctx, netConn.RemoteAddr(), c.activator) {
+			return netConn, true, nil
+		}
 		conn := newBufferedConn(netConn, c.cfg.ProbeBufferSize)
 		if isTCPProbe(ctx, conn) {
 			log.G(ctx).Debug("detected TCP kube-probe, ignoring connection")
@@ -39,6 +37,29 @@ func (c *Container) detectProbe(ctx context.Context) activator.ConnHook {
 		}
 		return conn, true, nil
 	}
+}
+
+func isKubeletAddr(ctx context.Context, remoteAddr net.Addr, act activator.Activator) bool {
+	srv, ok := act.(*activator.Server)
+	if !ok {
+		return false
+	}
+	tcpAddr, ok := remoteAddr.(*net.TCPAddr)
+	if !ok {
+		log.G(ctx).Debugf("remoteAddr is not a *net.TCPAddr: %T", remoteAddr)
+		return false
+	}
+	remoteIPAddr := tcpAddr.AddrPort().Addr().Unmap()
+	kubeletAddr, err := srv.GetKubeletAddr(remoteIPAddr.Is6())
+	if err != nil {
+		log.G(ctx).WithError(err).Debug("getting kubelet addr")
+		return false
+	}
+	if kubeletAddr.Unmap().Compare(remoteIPAddr) == 0 {
+		return true
+	}
+	log.G(ctx).Debugf("remote addr %s does not match kubelet addr %s", remoteIPAddr, kubeletAddr.Unmap().String())
+	return false
 }
 
 // isTCPProbe detects a TCP probe. It peeks 1 byte into the connection and if it
@@ -62,12 +83,12 @@ func isHTTPProbe(ctx context.Context, conn bufConn) bool {
 	}
 	b, err := conn.Peek(min(conn.r.Buffered(), conn.r.Size()))
 	if err != nil && err != io.EOF {
-		log.G(ctx).WithError(err).Error("peek")
+		log.G(ctx).WithError(err).Debug("peek")
 		return false
 	}
 	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(b)))
 	if err != nil {
-		log.G(ctx).WithError(err).Error("req")
+		log.G(ctx).WithError(err).Debug("req")
 		return false
 	}
 	return strings.HasPrefix(req.Header.Get("User-Agent"), "kube-probe/")

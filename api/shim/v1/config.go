@@ -1,8 +1,11 @@
-package shim
+package v1
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
@@ -15,11 +18,15 @@ import (
 )
 
 const (
+	DefaultOptDir                    = "/opt/zeropod"
+	ConfigDir                        = "etc"
+	ConfigFileName                   = "shim.json"
 	NodeLabel                        = "zeropod.ctrox.dev/node"
 	PortsAnnotationKey               = "zeropod.ctrox.dev/ports-map"
 	ContainerNamesAnnotationKey      = "zeropod.ctrox.dev/container-names"
 	ScaleDownDurationAnnotationKey   = "zeropod.ctrox.dev/scaledown-duration"
 	DisableCheckpoiningAnnotationKey = "zeropod.ctrox.dev/disable-checkpointing"
+	DryRunAnnotationKey              = "zeropod.ctrox.dev/dry-run"
 	PreDumpAnnotationKey             = "zeropod.ctrox.dev/pre-dump"
 	MigrateAnnotationKey             = "zeropod.ctrox.dev/migrate"
 	LiveMigrateAnnotationKey         = "zeropod.ctrox.dev/live-migrate"
@@ -43,13 +50,39 @@ const (
 	mappingDelim             = ";"
 	mapDelim                 = "="
 	defaultContainerdNS      = "k8s.io"
+	// DefaultProbeBufferSize should be able to fit kube-probe HTTP requests with
+	// reasonable path and header sizes but should still be small enough to not
+	// impact performance.
+	DefaultProbeBufferSize        = 1024
+	DefaultProbeBinaryName        = "kubelet"
+	DefaultTrackerIgnoreLocalhost = true
+	DefaultCapacityRequest        = false
+	DefaultReuseportActivator     = false
 )
 
-type Config struct {
+var ContainerdAnnotations = []string{
+	PortsAnnotationKey,
+	ContainerNamesAnnotationKey,
+	ScaleDownDurationAnnotationKey,
+	DisableCheckpoiningAnnotationKey,
+	DryRunAnnotationKey,
+	PreDumpAnnotationKey,
+	MigrateAnnotationKey,
+	LiveMigrateAnnotationKey,
+	DisableProbeDetectAnnotationKey,
+	ProbeBufferSizeAnnotationKey,
+	ProxyTimeoutAnnotationKey,
+	ConnectTimeoutAnnotationKey,
+	DisableMigrateDataAnnotationKey,
+	"io.containerd.runc.v2.group",
+}
+
+type AnnotationConfig struct {
 	ZeropodContainerNames []string
 	Ports                 []uint16
 	ScaleDownDuration     time.Duration
 	DisableCheckpointing  bool
+	DryRun                bool
 	PreDump               bool
 	Migrate               []string
 	LiveMigrate           string
@@ -65,7 +98,15 @@ type Config struct {
 	ConnectTimeout        time.Duration
 	DisableMigrateData    bool
 	WakePeers             []string
-	spec                  *specs.Spec
+	Spec                  *specs.Spec
+}
+
+type Config struct {
+	TrackerIgnoreLocalhost bool   `json:"trackerIgnoreLocalhost"`
+	CapacityRequest        bool   `json:"capacityRequest"`
+	ProbeAddress           string `json:"probeAddress"`
+	ReuseportActivator     bool   `json:"reuseportActivator"`
+	AnnotationConfig       `json:"-"`
 }
 
 // NewConfig uses the annotations from the container spec to create a new
@@ -144,6 +185,27 @@ func NewConfig(ctx context.Context, spec *specs.Spec) (*Config, error) {
 		migrate = strings.Split(migrateValue, containersDelim)
 	}
 
+	dryRunValue := spec.Annotations[DryRunAnnotationKey]
+	dryRun := false
+	if dryRunValue != "" {
+		dryRun, err = strconv.ParseBool(dryRunValue)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	liveMigrate := spec.Annotations[LiveMigrateAnnotationKey]
+	if dryRun {
+		if slices.Contains(migrate, containerName) {
+			log.G(ctx).Warnf("dry-run (%s) is set, disabling migrate for container %q", DryRunAnnotationKey, containerName)
+			migrate = slices.DeleteFunc(migrate, func(s string) bool { return s == containerName })
+		}
+		if liveMigrate != "" && liveMigrate == containerName {
+			log.G(ctx).Warnf("dry-run (%s) is set, disabling live-migrate for container %q", DryRunAnnotationKey, containerName)
+			liveMigrate = ""
+		}
+	}
+
 	ns, ok := namespaces.Namespace(ctx)
 	if !ok {
 		ns = defaultContainerdNS
@@ -158,7 +220,7 @@ func NewConfig(ctx context.Context, spec *specs.Spec) (*Config, error) {
 		}
 	}
 
-	probeBufferSize := defaultProbeBufferSize
+	probeBufferSize := DefaultProbeBufferSize
 	probeBufferSizeValue := spec.Annotations[ProbeBufferSizeAnnotationKey]
 	if probeBufferSizeValue != "" {
 		probeBufferSize, err = strconv.Atoi(probeBufferSizeValue)
@@ -193,19 +255,35 @@ func NewConfig(ctx context.Context, spec *specs.Spec) (*Config, error) {
 			return nil, err
 		}
 	}
+	cfg := &Config{
+		TrackerIgnoreLocalhost: DefaultTrackerIgnoreLocalhost,
+		CapacityRequest:        DefaultCapacityRequest,
+		ReuseportActivator:     DefaultReuseportActivator,
+	}
+	path, err := relativeConfigFile()
+	if err != nil {
+		return nil, err
+	}
+	b, err := os.ReadFile(path)
+	if err == nil {
+		if err := json.Unmarshal(b, cfg); err != nil {
+			return nil, err
+		}
+	}
 
 	var wakePeers []string
 	if v := spec.Annotations[WakePeersAnnotationKey]; v != "" {
 		wakePeers = strings.Split(v, containersDelim)
 	}
 
-	return &Config{
+	cfg.AnnotationConfig = AnnotationConfig{
 		Ports:                 containerPorts,
 		ScaleDownDuration:     dur,
 		DisableCheckpointing:  disableCheckpointing,
+		DryRun:                dryRun,
 		PreDump:               preDump,
 		Migrate:               migrate,
-		LiveMigrate:           spec.Annotations[LiveMigrateAnnotationKey],
+		LiveMigrate:           liveMigrate,
 		ZeropodContainerNames: containerNames,
 		ContainerName:         containerName,
 		ContainerType:         containerType,
@@ -219,8 +297,17 @@ func NewConfig(ctx context.Context, spec *specs.Spec) (*Config, error) {
 		ConnectTimeout:        connectTimeout,
 		DisableMigrateData:    disableMigrateData,
 		WakePeers:             wakePeers,
-		spec:                  spec,
-	}, nil
+		Spec:                  spec,
+	}
+	return cfg, nil
+}
+
+func relativeConfigFile() (string, error) {
+	e, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("getting executable dir: %w", err)
+	}
+	return filepath.Join(filepath.Dir(e), "..", ConfigDir, ConfigFileName), nil
 }
 
 func (cfg Config) IsZeropodContainer() bool {
@@ -242,4 +329,53 @@ func (cfg Config) LiveMigrationEnabled() bool {
 
 func (cfg Config) AnyMigrationEnabled() bool {
 	return cfg.migrationEnabled() || cfg.LiveMigrationEnabled()
+}
+
+func AnyMigrationEnabled(annotations map[string]string) bool {
+	_, migrate := annotations[MigrateAnnotationKey]
+	_, liveMigrate := annotations[LiveMigrateAnnotationKey]
+	return migrate || liveMigrate
+}
+
+func LiveMigrationEnabled(annotations map[string]string) bool {
+	_, ok := annotations[LiveMigrateAnnotationKey]
+	return ok
+}
+
+func (cfg Config) LastModified() time.Time {
+	configPath, err := relativeConfigFile()
+	if err != nil {
+		return time.Time{}
+	}
+	info, err := os.Stat(configPath)
+	if err != nil {
+		return time.Time{}
+	}
+	return info.ModTime()
+}
+
+func Load(optDir string) (*Config, error) {
+	b, err := os.ReadFile(filepath.Join(optDir, ConfigDir, ConfigFileName))
+	if err != nil {
+		return nil, err
+	}
+	cfg := &Config{}
+	if err := json.Unmarshal(b, cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func (cfg *Config) Write(optPath string) error {
+	b, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling config: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(optPath, ConfigDir), os.ModePerm); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(optPath, ConfigDir, ConfigFileName), b, 0600); err != nil {
+		return fmt.Errorf("unable to write shim file: %w", err)
+	}
+	return nil
 }

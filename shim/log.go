@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+
+	v1 "github.com/ctrox/zeropod/api/shim/v1"
 )
 
 // getLogPath gets the log path of the container by searching for the last log
@@ -13,13 +15,14 @@ import (
 // containerd only passes that to the sandbox container (pause). One possible
 // solution would be to implement log restoring in the sandbox container
 // instead of the zeropod.
-func getLogPath(cfg *Config) (string, error) {
+func getLogPath(cfg *v1.Config) (string, error) {
 	logDir := fmt.Sprintf("/var/log/pods/%s_%s_%s/%s", cfg.PodNamespace, cfg.PodName, cfg.PodUID, cfg.ContainerName)
 
 	dir, err := os.Open(logDir)
 	if err != nil {
 		return "", err
 	}
+	//nolint:errcheck
 	defer dir.Close()
 
 	names, err := dir.Readdirnames(0)

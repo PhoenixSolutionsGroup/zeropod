@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"maps"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
+	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -22,14 +24,13 @@ import (
 
 const (
 	BPFFSPath                      = "/sys/fs/bpf"
-	probeBinaryNameVariable        = "probe_binary_name"
-	probeBinaryNameMaxLength       = 16
-	SocketTrackerMap               = "socket_tracker"
-	PodKubeletAddrsMapv4           = "kubelet_addrs_v4"
-	PodKubeletAddrsMapv6           = "kubelet_addrs_v6"
-	trackerIgnoreLocalhostVariable = "tracker_ignore_localhost"
+	SocketTrackerMap               = bpfMapSocketTracker
+	PodKubeletAddrMapv4            = bpfMapKubeletAddrV4
+	PodKubeletAddrMapv6            = bpfMapKubeletAddrV6
+	trackerIgnoreLocalhostVariable = bpfVarTrackerIgnoreLocalhost
 	tcxIngressPinName              = "tcx_ingress"
 	tcxEgressPinName               = "tcx_egress"
+	ManagedByShimSuffix            = "_managed_by_shim"
 )
 
 type BPF struct {
@@ -44,9 +45,9 @@ type BPF struct {
 
 type BPFConfig struct {
 	mapSizes               map[string]uint32
-	probeBinaryName        string
 	trackerIgnoreLocalhost bool
 	disablePinning         bool
+	managedByShim          bool
 }
 
 type BPFOpts func(cfg *BPFConfig)
@@ -54,12 +55,6 @@ type BPFOpts func(cfg *BPFConfig)
 func OverrideMapSize(mapSizes map[string]uint32) BPFOpts {
 	return func(cfg *BPFConfig) {
 		maps.Copy(cfg.mapSizes, mapSizes)
-	}
-}
-
-func ProbeBinaryName(name string) BPFOpts {
-	return func(cfg *BPFConfig) {
-		cfg.probeBinaryName = name
 	}
 }
 
@@ -72,6 +67,12 @@ func TrackerIgnoreLocalhost(ignore bool) BPFOpts {
 func DisablePinning() BPFOpts {
 	return func(cfg *BPFConfig) {
 		cfg.disablePinning = true
+	}
+}
+
+func ShimManaged() BPFOpts {
+	return func(cfg *BPFConfig) {
+		cfg.managedByShim = true
 	}
 }
 
@@ -89,10 +90,15 @@ func InitBPF(pid int, log *slog.Logger, opts ...BPFOpts) (*BPF, error) {
 		return nil, err
 	}
 
-	// as a single shim process can host multiple containers, we store the map
-	// in a directory per shim process.
-	path := PinPath(pid)
-	if err := os.MkdirAll(path, os.ModePerm); err != nil {
+	// as a single shim process can host multiple pods, we store the map in a
+	// directory per sandbox pid.
+	pinPath := PinPath(pid)
+	if cfg.managedByShim {
+		if err := os.MkdirAll(pinPath+ManagedByShimSuffix, os.ModePerm); err != nil {
+			return nil, fmt.Errorf("failed to create bpf fs subpath: %w", err)
+		}
+	}
+	if err := os.MkdirAll(pinPath, os.ModePerm); err != nil {
 		return nil, fmt.Errorf("failed to create bpf fs subpath: %w", err)
 	}
 
@@ -101,18 +107,7 @@ func InitBPF(pid int, log *slog.Logger, opts ...BPFOpts) (*BPF, error) {
 		return nil, fmt.Errorf("loading bpf objects: %w", err)
 	}
 
-	if len([]byte(cfg.probeBinaryName)) > probeBinaryNameMaxLength {
-		return nil, fmt.Errorf(
-			"probe binary name %s is too long (%d bytes), max is %d bytes",
-			cfg.probeBinaryName, len([]byte(cfg.probeBinaryName)), probeBinaryNameMaxLength,
-		)
-	}
-	binName := [probeBinaryNameMaxLength]byte{}
-	copy(binName[:], cfg.probeBinaryName[:])
-	if err := spec.Variables[probeBinaryNameVariable].Set(binName); err != nil {
-		return nil, fmt.Errorf("setting probe binary variable: %w", err)
-	}
-	if err := spec.Variables[trackerIgnoreLocalhostVariable].Set(cfg.trackerIgnoreLocalhost); err != nil {
+	if err := setVar(spec, trackerIgnoreLocalhostVariable, cfg.trackerIgnoreLocalhost); err != nil {
 		return nil, fmt.Errorf("setting trackerIgnoreLocalhost variable: %w", err)
 	}
 
@@ -122,13 +117,95 @@ func InitBPF(pid int, log *slog.Logger, opts ...BPFOpts) (*BPF, error) {
 	objs := bpfObjects{}
 	if err := spec.LoadAndAssign(&objs, &ebpf.CollectionOptions{
 		Maps: ebpf.MapOptions{
-			PinPath: path,
+			PinPath: pinPath,
 		},
 	}); err != nil {
 		return nil, fmt.Errorf("loading objects: %w", err)
 	}
 
 	return &BPF{pid: pid, log: log, objs: &objs, noPin: cfg.disablePinning}, nil
+}
+
+// ManagedByShim returns true if loading/pinning is managed by the shim itself.
+func ManagedByShim(pid int) bool {
+	if _, err := os.Stat(PinPath(pid) + ManagedByShimSuffix); err == nil {
+		return true
+	}
+	return false
+}
+
+// TCXPinned returns true if all TCX programs for the pid are pinned.
+func TCXPinned(pid int, ifaces ...string) bool {
+	for _, iface := range ifaces {
+		for _, attach := range []ebpf.AttachType{ebpf.AttachTCXIngress, ebpf.AttachTCXEgress} {
+			_, err := os.Stat(tcxLinkPath(pid, iface, attach))
+			if err != nil {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// SetKubeletAddr puts the kubelet addr in the respective BPF map for v4/v6. It
+// will create and pin the map if it does not exist and freeze it afterwards. If
+// the map already exists and is frozen, this is a noop.
+func SetKubeletAddr(pid int, addr netip.Addr) error {
+	spec, err := loadBpf()
+	if err != nil {
+		return fmt.Errorf("loading bpf objects: %w", err)
+	}
+
+	mapName := PodKubeletAddrMapv4
+	if addr.Is6() {
+		mapName = PodKubeletAddrMapv6
+	}
+
+	// try to load pinned map first
+	kubeletAddrMap, err := ebpf.LoadPinnedMap(filepath.Join(PinPath(pid), mapName), &ebpf.LoadPinOptions{})
+	if err != nil {
+		mapSpec, ok := spec.Maps[mapName]
+		if !ok {
+			return fmt.Errorf("map %s not found", mapName)
+		}
+		kubeletAddrMap, err = ebpf.NewMapWithOptions(mapSpec, ebpf.MapOptions{PinPath: PinPath(pid)})
+		if err != nil {
+			return fmt.Errorf("failed to create map: %w", err)
+		}
+	}
+	//nolint:errcheck
+	defer kubeletAddrMap.Close()
+
+	info, err := kubeletAddrMap.Info()
+	if err != nil {
+		return err
+	}
+	if info.Frozen() {
+		return nil
+	}
+
+	var key uint32 = 0
+	var value any
+	if addr.Is4() {
+		value = addr.As4()
+	} else {
+		value = addr.As16()
+	}
+	if err := kubeletAddrMap.Put(key, value); err != nil {
+		return err
+	}
+
+	return kubeletAddrMap.Freeze()
+}
+
+func setVar(spec *ebpf.CollectionSpec, name string, value any) error {
+	if _, ok := spec.Variables[name]; !ok {
+		return fmt.Errorf("could not find var %s in spec", name)
+	}
+	if err := spec.Variables[name].Set(value); err != nil {
+		return fmt.Errorf("setting spec variable: %w", err)
+	}
+	return nil
 }
 
 func (bpf *BPF) Cleanup() error {
@@ -138,8 +215,10 @@ func (bpf *BPF) Cleanup() error {
 			errs = append(errs, fmt.Errorf("closing link: %w", err))
 		}
 	}
-	if err := bpf.objs.Close(); err != nil {
-		errs = append(errs, fmt.Errorf("unable to close bpf objects: %w", err))
+	if bpf.objs != nil {
+		if err := bpf.objs.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("unable to close bpf objects: %w", err))
+		}
 	}
 	for _, qdisc := range bpf.qdiscs {
 		if err := netlink.QdiscDel(qdisc); !os.IsNotExist(err) {
@@ -153,8 +232,31 @@ func (bpf *BPF) Cleanup() error {
 	}
 
 	bpf.log.Info("deleting", "path", PinPath(bpf.pid))
-	errs = append(errs, os.RemoveAll(PinPath(bpf.pid)))
+	errs = append(errs, CleanPinPath(bpf.pid))
 	return errors.Join(errs...)
+}
+
+func CleanPinPath(pid int) error {
+	return errors.Join(
+		os.RemoveAll(PinPath(pid)),
+		os.RemoveAll(PinPath(pid)+ManagedByShimSuffix),
+	)
+}
+
+func (bpf *BPF) AttachInNetNS(pid int, ifaces ...string) error {
+	netNS, err := ns.GetNS(netNSPath(pid))
+	if err != nil {
+		return err
+	}
+	if err := netNS.Do(func(nn ns.NetNS) error {
+		if err := bpf.AttachRedirector(ifaces...); err != nil {
+			return err
+		}
+		return err
+	}); err != nil {
+		return errors.Join(err, bpf.Cleanup())
+	}
+	return nil
 }
 
 func (bpf *BPF) AttachRedirector(ifaces ...string) error {
@@ -193,11 +295,7 @@ func (bpf *BPF) attachTCX(iface *net.Interface) error {
 }
 
 func (bpf *BPF) loadOrAttachTCXLink(iface *net.Interface, program *ebpf.Program, attach ebpf.AttachType) (link.Link, error) {
-	name := tcxIngressPinName
-	if attach == ebpf.AttachTCXEgress {
-		name = tcxEgressPinName
-	}
-	pinPath := filepath.Join(PinPath(bpf.pid), fmt.Sprintf("%s_%s", name, iface.Name))
+	pinPath := tcxLinkPath(bpf.pid, iface.Name, attach)
 	l, err := link.LoadPinnedLink(pinPath, nil)
 	if err == nil {
 		return l, nil
@@ -208,12 +306,20 @@ func (bpf *BPF) loadOrAttachTCXLink(iface *net.Interface, program *ebpf.Program,
 		Attach:    attach,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("could not attach TCX %s: %w", name, err)
+		return nil, fmt.Errorf("could not attach TCX %s: %w", pinPath, err)
 	}
 	if bpf.noPin {
 		return l, nil
 	}
 	return l, l.Pin(pinPath)
+}
+
+func tcxLinkPath(pid int, ifaceName string, attach ebpf.AttachType) string {
+	name := tcxIngressPinName
+	if attach == ebpf.AttachTCXEgress {
+		name = tcxEgressPinName
+	}
+	return filepath.Join(PinPath(pid), fmt.Sprintf("%s_%s", name, ifaceName))
 }
 
 func (bpf *BPF) attachQdisc(iface *net.Interface) error {
