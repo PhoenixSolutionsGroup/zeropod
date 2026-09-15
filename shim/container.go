@@ -620,7 +620,23 @@ func (c *Container) restoreHandler(ctx context.Context) activator.RestoreHook {
 
 		// Wake peer services concurrently before restoring ourselves.
 		// A TCP dial to a peer's zeropod proxy triggers its restore in parallel.
-		c.wakePeers(ctx)
+		for _, peer := range c.cfg.WakePeers {
+			go func(addr string) {
+				if err := c.netNS.Do(func(_ ns.NetNS) error {
+					conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+					if err != nil {
+						return err
+					}
+					// Send a byte so the peer's activator doesn't classify this
+					// as a kube-probe (bare connect+close) and skip the restore.
+					_, _ = conn.Write([]byte{0})
+					conn.Close()
+					return nil
+				}); err != nil {
+					log.G(ctx).Debugf("wake-peer %s: %s", addr, err)
+				}
+			}(peer)
+		}
 
 		restoredContainer, _, err := c.Restore(ctx)
 		if err != nil {
@@ -641,26 +657,6 @@ func (c *Container) restoreHandler(ctx context.Context) activator.RestoreHook {
 		c.Container = restoredContainer
 		c.ScheduleScaleDown()
 		return c.Pid(), nil
-	}
-}
-
-// wakePeers dials peer services so their zeropod proxies restore in parallel.
-// The dials run from the shim's own netns (the host) rather than the pod netns:
-// the pod netns is not routable while the container is being restored, but the
-// host netns reaches the peer without issue.
-func (c *Container) wakePeers(ctx context.Context) {
-	for _, peer := range c.cfg.WakePeers {
-		go func(addr string) {
-			conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-			if err != nil {
-				log.G(ctx).Debugf("wake-peer %s: %s", addr, err)
-				return
-			}
-			// Send a byte so the peer's activator doesn't classify this
-			// as a kube-probe (bare connect+close) and skip the restore.
-			_, _ = conn.Write([]byte{0})
-			conn.Close()
-		}(peer)
 	}
 }
 
