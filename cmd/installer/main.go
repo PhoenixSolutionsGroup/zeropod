@@ -351,8 +351,23 @@ func configureContainerdv2(ctx context.Context, runtime containerRuntime, contai
 	}
 
 	if zeropodImportConfigured(conf.Imports) {
-		log.Println("runtime already configured, no need to restart containerd")
-		return false, nil
+		if current, err := os.ReadFile(zeropodRuntimeConfigPath(containerdConfig)); err == nil && bytes.Contains(current, []byte(annotationsToml())) {
+			log.Println("runtime already configured, no need to restart containerd")
+			return false, nil
+		}
+		existingOpt, containerdOptPath, err := optConfigured(ctx, containerdConfig)
+		if err != nil {
+			return false, fmt.Errorf("could not check opt configuration: %w", err)
+		}
+		optPath := *hostOptPath
+		if existingOpt {
+			optPath = containerdOptPath
+		}
+		if _, err := writeZeropodRuntimeConfig(containerdConfig, optPath, existingOpt, conf.Version); err != nil {
+			return false, err
+		}
+		log.Println("zeropod runtime config updated, restarting containerd")
+		return true, nil
 	}
 
 	existingOpt, containerdOptPath, err := optConfigured(ctx, containerdConfig)
@@ -383,7 +398,7 @@ func configureContainerdv2(ctx context.Context, runtime containerRuntime, contai
 		optPath = containerdOptPath
 	}
 
-	if err := writeZeropodRuntimeConfig(containerdConfig, optPath, existingOpt, conf.Version); err != nil {
+	if _, err := writeZeropodRuntimeConfig(containerdConfig, optPath, existingOpt, conf.Version); err != nil {
 		return false, err
 	}
 
@@ -532,7 +547,7 @@ func backupContainerdConfig(containerdConfig string) error {
 	return copyConfig(containerdConfig, containerdConfig+configBackupSuffix)
 }
 
-func writeZeropodRuntimeConfig(containerdConfig, optPath string, existingOpt bool, version int) error {
+func zeropodRuntimeConfigString(containerdConfig, optPath string, existingOpt bool, version int) string {
 	zeropodRuntimeConfig := fmt.Sprintf("%s\n%s", configVersion2, runtimeConfig)
 	if version == 3 {
 		zeropodRuntimeConfig = runtimeConfigV3
@@ -544,12 +559,22 @@ func writeZeropodRuntimeConfig(containerdConfig, optPath string, existingOpt boo
 		annotationsToml(),
 	)
 	if !existingOpt {
-		zeropodRuntimeConfig = zeropodRuntimeConfig + fmt.Sprintf(optPlugin, optPath)
+		zeropodRuntimeConfig += fmt.Sprintf(optPlugin, optPath)
 	}
-	if err := os.WriteFile(zeropodRuntimeConfigPath(containerdConfig), []byte(zeropodRuntimeConfig), 0644); err != nil {
-		return fmt.Errorf("writing zeropod runtime config: %w", err)
+	return zeropodRuntimeConfig
+}
+
+func writeZeropodRuntimeConfig(containerdConfig, optPath string, existingOpt bool, version int) (bool, error) {
+	path := zeropodRuntimeConfigPath(containerdConfig)
+	current, err := os.ReadFile(path)
+	desired := zeropodRuntimeConfigString(containerdConfig, optPath, existingOpt, version)
+	if err == nil && string(current) == desired {
+		return false, nil
 	}
-	return nil
+	if err := os.WriteFile(path, []byte(desired), 0644); err != nil {
+		return false, fmt.Errorf("writing zeropod runtime config: %w", err)
+	}
+	return true, nil
 }
 
 func annotationsToml() string {

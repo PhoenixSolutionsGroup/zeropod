@@ -228,7 +228,8 @@ func setupTestConfig(t *testing.T, tc testConfig) string {
 
 	if tc.preCreateZeropodConfig {
 		if !tc.containerdv1 {
-			require.NoError(t, writeZeropodRuntimeConfig(configFile.Name(), tc.expectedOptPath, tc.expectedOptPath == "", 2))
+			_, err := writeZeropodRuntimeConfig(configFile.Name(), tc.expectedOptPath, tc.expectedOptPath == "", 2)
+			require.NoError(t, err)
 		}
 		require.NoError(t, backupContainerdConfig(configFile.Name()))
 	}

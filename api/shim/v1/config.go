@@ -74,6 +74,7 @@ var ContainerdAnnotations = []string{
 	ProxyTimeoutAnnotationKey,
 	ConnectTimeoutAnnotationKey,
 	DisableMigrateDataAnnotationKey,
+	WakePeersAnnotationKey,
 	"io.containerd.runc.v2.group",
 }
 
