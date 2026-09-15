@@ -15,10 +15,10 @@ func TestCheckpointExtraArgs(t *testing.T) {
 		"1.0.0":   {expectedArgs: []string{}},
 		"1.2.0":   {expectedArgs: []string{}},
 		"1.2.6":   {expectedArgs: []string{}},
-		"1.3.0":   {expectedArgs: []string{checkpointArgSkipTCPInFlight, checkpointArgForceIRMap}},
-		"1.3.3":   {expectedArgs: []string{checkpointArgSkipTCPInFlight, checkpointArgForceIRMap}},
-		"1.10.4":  {expectedArgs: []string{checkpointArgSkipTCPInFlight, checkpointArgForceIRMap}},
-		"20.0.4":  {expectedArgs: []string{checkpointArgSkipTCPInFlight, checkpointArgForceIRMap}},
+		"1.3.0":   {expectedArgs: []string{checkpointArgSkipTCPInFlight}},
+		"1.3.3":   {expectedArgs: []string{checkpointArgSkipTCPInFlight}},
+		"1.10.4":  {expectedArgs: []string{checkpointArgSkipTCPInFlight}},
+		"20.0.4":  {expectedArgs: []string{checkpointArgSkipTCPInFlight}},
 	} {
 		t.Run(version, func(t *testing.T) {
 			c := Container{runcVersion: version}
