@@ -158,7 +158,10 @@ func (c *Container) checkpoint(ctx context.Context) error {
 	return nil
 }
 
-const checkpointArgSkipTCPInFlight = "--tcp-skip-in-flight"
+const (
+	checkpointArgSkipTCPInFlight = "--tcp-skip-in-flight"
+	checkpointArgForceIRMap       = "--force-irmap"
+)
 
 func (c *Container) checkpointExtraArgs() []string {
 	def := []string{}
@@ -175,7 +178,7 @@ func (c *Container) checkpointExtraArgs() []string {
 		return def
 	}
 	if maj == 1 && min >= 3 || maj > 1 {
-		return []string{checkpointArgSkipTCPInFlight}
+		return []string{checkpointArgSkipTCPInFlight, checkpointArgForceIRMap}
 	}
 	return def
 }
