@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -618,25 +617,7 @@ func (c *Container) restoreHandler(ctx context.Context) activator.RestoreHook {
 	return func() (int, error) {
 		log.G(ctx).Printf("got a request")
 
-		// Wake peer services concurrently before restoring ourselves.
-		// A TCP dial to a peer's zeropod proxy triggers its restore in parallel.
-		for _, peer := range c.cfg.WakePeers {
-			go func(addr string) {
-				if err := c.netNS.Do(func(_ ns.NetNS) error {
-					conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-					if err != nil {
-						return err
-					}
-					// Send a byte so the peer's activator doesn't classify this
-					// as a kube-probe (bare connect+close) and skip the restore.
-					_, _ = conn.Write([]byte{0})
-					conn.Close()
-					return nil
-				}); err != nil {
-					log.G(ctx).Debugf("wake-peer %s: %s", addr, err)
-				}
-			}(peer)
-		}
+		c.wakePeers(ctx)
 
 		restoredContainer, _, err := c.Restore(ctx)
 		if err != nil {
