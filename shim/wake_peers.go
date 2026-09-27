@@ -18,9 +18,14 @@ const wakePeerDialTimeout = 5 * time.Second
 // wakePeers dials peer services so their zeropod activators restore in
 // parallel with this container. Names are resolved through the pod's DNS
 // (e.g. CoreDNS) since the shim runs with the host's resolv.conf, which
-// cannot resolve cluster service names.
+// cannot resolve cluster service names. Peers are woken at most once per
+// scale-down cycle: the restore hook fires for every incoming connection, and
+// peers dialing each other back would otherwise cascade into a connection storm.
 func (c *Container) wakePeers(ctx context.Context) {
 	if len(c.cfg.WakePeers) == 0 {
+		return
+	}
+	if !c.peersWoken.CompareAndSwap(false, true) {
 		return
 	}
 	dialer := &net.Dialer{Timeout: wakePeerDialTimeout, Resolver: podResolver(ctx, c.cfg.Spec)}

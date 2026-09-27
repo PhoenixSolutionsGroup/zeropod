@@ -59,6 +59,7 @@ type Container struct {
 	initTimer        *time.Timer
 	initBackoff      time.Duration
 	evacDrainStarted atomic.Bool
+	peersWoken       atomic.Bool
 	drainTimer       *time.Timer
 	drainStartTime   time.Time
 	platform         stdio.Platform
@@ -270,6 +271,7 @@ func (c *Container) setPhase(phase v1.ContainerPhase, duration time.Duration) {
 			c.metrics.LastCheckpoint = timestamppb.Now()
 		}
 		c.scaledDown = true
+		c.peersWoken.Store(false)
 		c.metrics.Running = false
 		if err := c.updateCheckpointMemoryBytes(); err != nil {
 			log.G(c.context).WithError(err).Error("updating checkpoint memory metric")
